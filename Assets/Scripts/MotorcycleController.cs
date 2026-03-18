@@ -14,11 +14,23 @@ public class MotorcycleController : MonoBehaviour
     ///////////////////////
     [Header("MOTORCYCLE VALUES")]
     [SerializeField] WheelCollider frontWheelCollider;
+    [SerializeField] WheelCollider rearWheelCollider;
     [SerializeField] Transform[] SteeringPiecesTransforms;
     [SerializeField] float movePower;
     [SerializeField] float brakePower;
     [SerializeField] float inNeutralBrakePower;
     [SerializeField] float maxSteerRotateAngle;
+    [SerializeField] Vector3 centerOfMassOffset = new Vector3(0f, -0.45f, 0f);
+    [SerializeField] float forwardFrictionStiffness = 1.8f;
+    [SerializeField] float sidewaysFrictionStiffness = 2.1f;
+    [SerializeField] float suspensionSpring = 35000f;
+    [SerializeField] float suspensionDamper = 4500f;
+    [SerializeField] float minSteerMultiplier = 0.35f;
+    [SerializeField] float lowSpeedSteerReductionThreshold = 6f;
+    [SerializeField] float fullSteerSpeedThreshold = 24f;
+    [SerializeField] float slopeSteerReductionStartAngle = 10f;
+    [SerializeField] float slopeSteerReductionMaxAngle = 35f;
+    [SerializeField] float riderLeanTorque = 170f;
     //
     float currentSteerRotateAngle;
     bool isBraking;
@@ -35,6 +47,8 @@ public class MotorcycleController : MonoBehaviour
     float speedDetector;
     float slideValue;
     bool canMoveToFront = true;
+    bool isStalled;
+    bool isSpinout;
 
     ///////////////////////
     [Header("BIKER")]
@@ -58,6 +72,11 @@ public class MotorcycleController : MonoBehaviour
     void Start()
     {
         motorcycleRigidbody = GetComponent<Rigidbody>();
+        ResolveWheelColliders();
+        motorcycleRigidbody.centerOfMass = centerOfMassOffset;
+        ApplyWheelSetup(frontWheelCollider);
+        ApplyWheelSetup(rearWheelCollider);
+
         startPosition = transform.position;
         startRotation = transform.rotation;
         bikerStartPosition = bikerParentGameObject.transform.position;
@@ -78,6 +97,7 @@ public class MotorcycleController : MonoBehaviour
     {
         VerticalMove();
         HorizontalMove();
+        ApplyRiderLeanControl();
         CheckPutBrake();
         FollowAllSteeringPieceToWheelRotation();
         TiltingToMotorcycle();
@@ -91,7 +111,9 @@ public class MotorcycleController : MonoBehaviour
             return;
 
         float verticalInput = Input.GetAxis("Vertical");
-        frontWheelCollider.motorTorque = verticalInput * movePower;
+        WheelCollider driveWheelCollider = rearWheelCollider != null ? rearWheelCollider : frontWheelCollider;
+        if (driveWheelCollider != null)
+            driveWheelCollider.motorTorque = verticalInput * movePower;
         //
         if(verticalInput > 0 && canMoveToFront)
         {
@@ -102,13 +124,13 @@ public class MotorcycleController : MonoBehaviour
         else if (verticalInput == 0)
         {
             SetMotorcycleInNeutralSound();
-            frontWheelCollider.brakeTorque = inNeutralBrakePower;
+            ApplyBrakeTorqueToAllWheels(inNeutralBrakePower);
             isMovingSoundPlaying = false;
         }
         else
         {
             SetMotorcycleInNeutralSound();
-            frontWheelCollider.brakeTorque = 0;
+            ApplyBrakeTorqueToAllWheels(0f);
             isMovingSoundPlaying = false;
         }
     }
@@ -118,8 +140,12 @@ public class MotorcycleController : MonoBehaviour
         if (!CanRide())
             return;
 
+        if (frontWheelCollider == null)
+            return;
+
         float horizontalInput = Input.GetAxis("Horizontal");
-        currentSteerRotateAngle = maxSteerRotateAngle * horizontalInput;
+        float steerMultiplier = CalculateSteerMultiplier();
+        currentSteerRotateAngle = maxSteerRotateAngle * steerMultiplier * horizontalInput;
         frontWheelCollider.steerAngle = currentSteerRotateAngle;
         //
         if (horizontalInput > 0.3f)
@@ -130,10 +156,25 @@ public class MotorcycleController : MonoBehaviour
             FollowBikerArmsToSteeringWhenNoTurn();
     }
 
+    void ApplyRiderLeanControl()
+    {
+        if (!CanRide())
+            return;
+
+        float leanInput = Input.GetAxis("Vertical");
+        if (Mathf.Abs(leanInput) < 0.01f)
+            return;
+
+        motorcycleRigidbody.AddTorque(transform.right * leanInput * riderLeanTorque, ForceMode.Acceleration);
+    }
+
     ///////////////////////
     // Tilting To Motorcycle
     void TiltingToMotorcycle()
     {
+        if (frontWheelCollider == null)
+            return;
+
         float zPosition = frontWheelCollider.steerAngle;
         zPosition = Mathf.Clamp(zPosition, -25, 25);
         //
@@ -150,7 +191,7 @@ public class MotorcycleController : MonoBehaviour
 
         isBraking = Input.GetKey(KeyCode.Space);
         currentBrakePower = isBraking ? brakePower : 0f;
-        frontWheelCollider.brakeTorque = currentBrakePower;
+        ApplyBrakeTorqueToAllWheels(currentBrakePower);
         if (isBraking)
             SetMotorcycleBrakingSound();
         else
@@ -166,7 +207,12 @@ public class MotorcycleController : MonoBehaviour
         slideValue = Vector3.Dot(motorcycleRigidbody.velocity.normalized, transform.forward);
         if (slideValue > 0 && slideValue < 0.7f && speedDetector>20f)
         {
-            motorcycleRigidbody.velocity = Vector3.zero;
+            if (isStalled || isSpinout)
+                motorcycleRigidbody.velocity = Vector3.zero;
+
+            ApplyBrakeTorqueToAllWheels(brakePower * 0.6f);
+            Vector3 forwardVelocity = Vector3.Project(motorcycleRigidbody.velocity, transform.forward);
+            motorcycleRigidbody.velocity = Vector3.Lerp(motorcycleRigidbody.velocity, forwardVelocity, 0.2f);
             SetMotorcycleBrakingSound();
             canMoveToFront = false;
             speedDetector = 0;
@@ -184,6 +230,9 @@ public class MotorcycleController : MonoBehaviour
     // Follow Components To Each Other
     void FollowAllSteeringPieceToWheelRotation()
     {
+        if (frontWheelCollider == null)
+            return;
+
         foreach (Transform piece in SteeringPiecesTransforms)
         {
             piece.localEulerAngles = new Vector3(piece.localEulerAngles.x, frontWheelCollider.steerAngle, piece.localEulerAngles.z);
@@ -298,6 +347,7 @@ public class MotorcycleController : MonoBehaviour
     {
         if(other.gameObject.CompareTag("Obstacle"))
         {
+            isSpinout = true;
             gameManager?.OnRiderEjected();
         }
     }
@@ -318,6 +368,8 @@ public class MotorcycleController : MonoBehaviour
     {
         StopAllCoroutines();
         canMoveToFront = true;
+        isStalled = false;
+        isSpinout = false;
         speedDetector = 0f;
         slideValue = 0f;
         speed = 0;
@@ -342,9 +394,97 @@ public class MotorcycleController : MonoBehaviour
         BikerRigidbodiesKinematicSituation(true);
         BikerCollidersEnabledSituation(false);
 
-        frontWheelCollider.motorTorque = 0f;
-        frontWheelCollider.brakeTorque = 0f;
-        frontWheelCollider.steerAngle = 0f;
+        if (frontWheelCollider != null)
+        {
+            frontWheelCollider.brakeTorque = 0f;
+            frontWheelCollider.steerAngle = 0f;
+        }
+
+        if (rearWheelCollider != null)
+        {
+            rearWheelCollider.motorTorque = 0f;
+            rearWheelCollider.brakeTorque = 0f;
+        }
+    }
+
+    void ResolveWheelColliders()
+    {
+        if (frontWheelCollider != null && rearWheelCollider != null)
+            return;
+
+        WheelCollider[] wheelColliders = GetComponentsInChildren<WheelCollider>();
+        if (wheelColliders.Length == 0)
+            return;
+
+        WheelCollider frontCandidate = null;
+        WheelCollider rearCandidate = null;
+        float maxZ = float.MinValue;
+        float minZ = float.MaxValue;
+
+        foreach (WheelCollider wheel in wheelColliders)
+        {
+            float localZ = transform.InverseTransformPoint(wheel.transform.position).z;
+            if (localZ > maxZ)
+            {
+                maxZ = localZ;
+                frontCandidate = wheel;
+            }
+
+            if (localZ < minZ)
+            {
+                minZ = localZ;
+                rearCandidate = wheel;
+            }
+        }
+
+        if (frontWheelCollider == null)
+            frontWheelCollider = frontCandidate;
+
+        if (rearWheelCollider == null)
+            rearWheelCollider = rearCandidate != frontWheelCollider ? rearCandidate : null;
+    }
+
+    void ApplyWheelSetup(WheelCollider wheelCollider)
+    {
+        if (wheelCollider == null)
+            return;
+
+        WheelFrictionCurve forwardFriction = wheelCollider.forwardFriction;
+        forwardFriction.stiffness = forwardFrictionStiffness;
+        wheelCollider.forwardFriction = forwardFriction;
+
+        WheelFrictionCurve sidewaysFriction = wheelCollider.sidewaysFriction;
+        sidewaysFriction.stiffness = sidewaysFrictionStiffness;
+        wheelCollider.sidewaysFriction = sidewaysFriction;
+
+        JointSpring suspension = wheelCollider.suspensionSpring;
+        suspension.spring = suspensionSpring;
+        suspension.damper = suspensionDamper;
+        wheelCollider.suspensionSpring = suspension;
+    }
+
+    void ApplyBrakeTorqueToAllWheels(float brakeTorque)
+    {
+        if (frontWheelCollider != null)
+            frontWheelCollider.brakeTorque = brakeTorque;
+
+        if (rearWheelCollider != null)
+            rearWheelCollider.brakeTorque = brakeTorque;
+    }
+
+    float CalculateSteerMultiplier()
+    {
+        float speedKmh = motorcycleRigidbody.velocity.magnitude * 3.6f;
+        float speedMultiplier = Mathf.InverseLerp(lowSpeedSteerReductionThreshold, fullSteerSpeedThreshold, speedKmh);
+
+        float slopeAngle = 0f;
+        if (frontWheelCollider != null && frontWheelCollider.GetGroundHit(out WheelHit hit))
+            slopeAngle = Vector3.Angle(hit.normal, Vector3.up);
+
+        float slopeMultiplier = 1f - Mathf.InverseLerp(slopeSteerReductionStartAngle, slopeSteerReductionMaxAngle, slopeAngle);
+        float steerMultiplier = speedMultiplier * slopeMultiplier;
+
+        return Mathf.Clamp(steerMultiplier, minSteerMultiplier, 1f);
     }
 
 }
